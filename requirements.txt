@@ -1,5 +1,7 @@
+opencv-python
 rapidocr_onnxruntime
 onnxruntime
 pillow
 sounddevice
 kokoro
+webrtcvad-wheels
