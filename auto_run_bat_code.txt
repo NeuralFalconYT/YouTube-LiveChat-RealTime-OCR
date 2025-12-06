@@ -5,7 +5,7 @@
 cd /d "E:\2026\YouTube-LiveChat-RealTime-OCR"
 
 :: Run bot.py with the system Python
-python bot.py
+python echo_bot.py
 
 :: Keep window open after the script finishes
 pause
