@@ -1,5 +1,5 @@
 
-# YT-LiveChat-Capture-OCR
+# YouTube LiveChat RealTime OCR
 
 A real-time YouTube Live Chat capture tool powered by on-screen OCR.  
 Designed for creators who want interactive livestreams where viewers can chat or talk with an AI using TTS or chatbot responses.
@@ -82,7 +82,7 @@ start_ocr(on_new_chat)
 ## 📁 Project Structure
 
 ```
-YT-LiveChat-Capture-OCR/
+YouTube-LiveChat-RealTime-OCR/
 │
 ├── models/                         # Pre-trained RapidOCR model files (Apache-2.0 licensed)
 │   ├── ch_PP-OCRv5_mobile_det.onnx             # Text detection model 
