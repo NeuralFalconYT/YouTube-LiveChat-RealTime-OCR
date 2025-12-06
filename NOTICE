@@ -1,0 +1,12 @@
+This project uses OCR model files from RapidOCR:
+https://github.com/RapidAI/RapidOCR
+
+The OCR models included in this repository are originally distributed by RapidAI
+and are licensed under the Apache License, Version 2.0.
+
+No modifications have been made to the original model files.
+
+All credit and ownership of the OCR models belong to RapidAI and its contributors.
+
+You may obtain a copy of the Apache License at:
+https://www.apache.org/licenses/LICENSE-2.0
