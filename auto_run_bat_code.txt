@@ -1,0 +1,11 @@
+@echo off
+
+:: Move to your project folder
+:: ⚠ Replace the folder path below with the actual path to YOUR project
+cd /d "E:\2026\YouTube-LiveChat-RealTime-OCR"
+
+:: Run bot.py with the system Python
+python bot.py
+
+:: Keep window open after the script finishes
+pause
