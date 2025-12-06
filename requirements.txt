@@ -1,6 +1,9 @@
+#for only ocr 
 opencv-python
 rapidocr_onnxruntime
 onnxruntime
+
+#for echo bot and chatgpt voice call example
 pillow
 sounddevice
 kokoro
