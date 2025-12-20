@@ -1,4 +1,3 @@
-# read youtbe live chat comment and pass it to llm for ai live stream
 import os
 import time
 import re
@@ -12,6 +11,7 @@ from difflib import SequenceMatcher
 from datetime import datetime
 from collections import Counter
 
+# KEEPING YOUR ORIGINAL SELECTOR
 from overlay_select import ScreenSelector
 from local_ocr import ocr
 
@@ -32,8 +32,16 @@ CAPTURE_SLEEP = 0.05
 SIMILARITY_THRESHOLD = 0.85
 FREEZE_FRAMES = 5
 
-EDGE_DELTA_THRESHOLD = 120
 ROI_START_RATIO = 0.70
+
+# --- SENSITIVITY SETTINGS (UPDATED) ---
+# 1. How much a pixel must change color to be considered "movement" (0-255)
+#    Keeps this at ~20 to ignore video compression noise.
+NOISE_THRESHOLD = 20 
+
+# 2. How many pixels must change to trigger OCR?
+#    "bye" is small. ~30 pixels ensures we catch short words.
+PIXEL_DIFF_THRESHOLD = 30  
 
 # Spam control (Bursts)
 SPAM_WINDOW = 15        # seconds
@@ -124,9 +132,11 @@ def sql_should_emit(username, text, now, display_log):
 
 last_frame_norm = []
 sig_history = []
-prev_edge_count = None
 spam_memory = {}
 recent_signatures = {}
+
+# NEW STATE FOR MOTION DETECTION
+prev_gray_frame = None
 
 # ============================================================
 # HELPERS
@@ -210,7 +220,7 @@ def check_frozen(sig, display_log):
 # ============================================================
 
 def start_ocr(callback, debug=False, display_log=False):
-    global _sql, _cur, prev_edge_count, last_frame_norm, recent_signatures, spam_memory
+    global _sql, _cur, last_frame_norm, recent_signatures, spam_memory, prev_gray_frame
 
     _sql, _cur = init_db(debug)
     selector = ScreenSelector()
@@ -234,37 +244,35 @@ def start_ocr(callback, debug=False, display_log=False):
             if keyboard.is_pressed("f8"):
                 log("🔄 F8 Pressed! Re-selecting region...", True)
                 
-                # Cleanup Debug Windows to clear screen
                 if debug:
                     cv2.destroyAllWindows()
                 
-                # Wait for key release to prevent instant re-trigger
                 while keyboard.is_pressed("f8"):
                     time.sleep(0.1)
 
-                # Select New Area
                 new_region = selector.select_area()
                 
                 if new_region:
                     region = new_region
                     left, top, right, bottom = map(int, region)
                     
-                    # RESET ALL STATE (Like a fresh start)
+                    # RESET ALL STATE
                     last_frame_norm = []
                     recent_signatures.clear()
                     spam_memory.clear()
-                    prev_edge_count = None
+                    prev_gray_frame = None # Reset visual buffer
                     
                     log(f"📌 NEW Region Selected: {left, top, right, bottom}", True)
                     log("♻️  Memory Reset - Starting Fresh", True)
                 else:
                     log("❌ Selection cancelled, continuing with old region.", True)
                 
-                # Small pause before resuming
                 time.sleep(0.5)
                 continue
-            # ============================================================
 
+            # ============================================================
+            # CAPTURE
+            # ============================================================
             grab = sct.grab({
                 "left": left,
                 "top": top,
@@ -275,23 +283,49 @@ def start_ocr(callback, debug=False, display_log=False):
             frame = np.array(grab)[:, :, :3]
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            h, _ = gray.shape
-            roi = gray[int(h * ROI_START_RATIO):]
-            edges = cv2.Canny(roi, 50, 150)
-            edge_count = np.count_nonzero(edges)
+            # Focus on bottom 30% where new messages appear
+            h, w = gray.shape
+            roi_gray = gray[int(h * ROI_START_RATIO):, :]
 
-            delta = abs(edge_count - prev_edge_count) if prev_edge_count else 999
-            prev_edge_count = edge_count
+            # ============================================================
+            # NEW TRIGGER LOGIC (PIXEL DIFFERENCE)
+            # ============================================================
+            should_run_ocr = False
+            
+            if prev_gray_frame is None:
+                should_run_ocr = True 
+            else:
+                # Calculate difference
+                diff_frame = cv2.absdiff(roi_gray, prev_gray_frame)
+                
+                # Remove noise (only keep pixels that changed significantly)
+                _, thresh = cv2.threshold(diff_frame, NOISE_THRESHOLD, 255, cv2.THRESH_BINARY)
+                
+                # Count changed pixels
+                pixel_diff = np.count_nonzero(thresh)
+                
+                # Check threshold (30 pixels)
+                if pixel_diff > PIXEL_DIFF_THRESHOLD:
+                    should_run_ocr = True
+                    log(f"⚡ Motion: {pixel_diff}px changed", display_log)
+
+            # Update buffer
+            prev_gray_frame = roi_gray.copy()
 
             if debug:
                 cv2.imshow("CHAT", frame)
+                cv2.imshow("ROI", roi_gray)
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
 
-            if delta <= EDGE_DELTA_THRESHOLD:
+            # If no visual change, sleep and skip
+            if not should_run_ocr:
                 time.sleep(CAPTURE_SLEEP)
                 continue
 
+            # ============================================================
+            # RUN OCR
+            # ============================================================
             comments = ocr(frame) or []
             
             if check_frozen(build_signature(comments), display_log):
