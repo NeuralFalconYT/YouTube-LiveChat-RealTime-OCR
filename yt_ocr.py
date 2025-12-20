@@ -1,6 +1,3 @@
-"""
-yt_ocr.py — extract live chat from yt live realtime 
-"""
 
 
 import os
@@ -32,19 +29,22 @@ except Exception:
 # CONFIG
 # ============================================================
 
-CAPTURE_SLEEP = 0.03
-SIMILARITY_THRESHOLD = 0.86
-FREEZE_FRAMES = 4
+CAPTURE_SLEEP = 0.05
+SIMILARITY_THRESHOLD = 0.85
+FREEZE_FRAMES = 5
 
 EDGE_DELTA_THRESHOLD = 120
 ROI_START_RATIO = 0.70
 
-# Spam control
+# Spam control (Bursts)
 SPAM_WINDOW = 15        # seconds
-SPAM_MAX_COUNT = 3     # msgs per window
+SPAM_MAX_COUNT = 3      # msgs per window
 
-# SQL reread protection (seconds)
-SQL_REREAD_BLOCK = 0.8
+# Deduplication / Re-read control
+# If the exact same user sends the exact same text within this time, 
+# we ignore it (assumes it's OCR reading the same line again).
+# After this time, we allow the message to be printed again.
+DEDUPE_TIMEOUT = 45.0 
 
 # ============================================================
 # DEBUG
@@ -96,7 +96,7 @@ def norm(s):
     return re.sub(r"\s+", " ", s)
 
 # ============================================================
-# SQL — ONLY BLOCK OCR REREADS
+# SQL — DATABASE LOGGING
 # ============================================================
 
 def sql_should_emit(username, text, now, display_log):
@@ -109,25 +109,17 @@ def sql_should_emit(username, text, now, display_log):
     ).fetchone()
 
     if row is None:
-        log("🟥 SQL NEW", display_log)
-        _cur.execute(
-            "INSERT INTO emitted VALUES (?, ?, ?)",
-            (u, t, now)
-        )
+        _cur.execute("INSERT INTO emitted VALUES (?, ?, ?)", (u, t, now))
         _sql.commit()
         return True
 
     last_emit = row[0]
 
-    if now - last_emit < SQL_REREAD_BLOCK:
-        log("🟥 SQL BLOCK → OCR reread", display_log)
+    # If seen recently, block it
+    if now - last_emit < DEDUPE_TIMEOUT:
         return False
 
-    log("🟥 SQL PASS", display_log)
-    _cur.execute(
-        "UPDATE emitted SET last_emit=? WHERE user=? AND text=?",
-        (now, u, t)
-    )
+    _cur.execute("UPDATE emitted SET last_emit=? WHERE user=? AND text=?", (now, u, t))
     _sql.commit()
     return True
 
@@ -139,36 +131,66 @@ last_frame_norm = []
 sig_history = []
 prev_edge_count = None
 
-# spam memory: (user,text) -> timestamps
+# spam memory
 spam_memory = {}
+
+# MEMORY DICTIONARY
+# Format: { "signature_string": timestamp_of_last_seen }
+recent_signatures = {}
 
 # ============================================================
 # HELPERS
 # ============================================================
 
 def normalize_line(u, t):
-    return re.sub(r"[^a-z0-9@]", "", f"{u} {t}".lower())
+    return re.sub(r"[^a-z0-9@]", "", f"{u}{t}".lower())
 
 def similar(a, b):
     return SequenceMatcher(None, a, b).ratio() >= SIMILARITY_THRESHOLD
 
+# ============================================================
+# CORE LOGIC: DETECT NEW MESSAGES
+# ============================================================
+
 def detect_new(prev_norm, curr_norm, raw, display_log):
+    """
+    Compares previous frame to current frame.
+    Returns only the lines that are visibly new.
+    """
+    
+    # 1. Startup / Baseline Reset
     if not prev_norm:
-        log("🟩 FIRST FRAME → all new", display_log)
-        return raw[:]
+        log("⚠️ BASELINE SET → Waiting for new chat...", display_log)
+        return []
 
-    new = []
-    i = len(curr_norm) - 1
-    j = len(prev_norm) - 1
+    # 2. Anchor Search (Overlap Detection)
+    last_prev_sig = prev_norm[-1]
+    match_index = -1
+    
+    for i in range(len(curr_norm) - 1, -1, -1):
+        if similar(curr_norm[i], last_prev_sig):
+            context_match = True
+            if i > 0 and len(prev_norm) > 1:
+                if not similar(curr_norm[i-1], prev_norm[-2]):
+                    context_match = False
+            
+            if context_match:
+                match_index = i
+                break
+    
+    if match_index != -1:
+        return raw[match_index + 1:]
 
-    while i >= 0:
-        if j >= 0 and similar(curr_norm[i], prev_norm[j]):
-            break
-        log(f"🟩 NEW → {curr_norm[i]}", display_log)
-        new.append(raw[i])
-        i -= 1
+    # 3. Fallback
+    if len(prev_norm) > 1:
+        second_last = prev_norm[-2]
+        for i in range(len(curr_norm) - 1, -1, -1):
+            if similar(curr_norm[i], second_last):
+                return raw[i + 2:]
 
-    return new[::-1]
+    # 4. Sync Lost
+    log("⚠️ SYNC LOST → Resetting baseline", display_log)
+    return []
 
 def build_signature(comments):
     return [norm(u) + ":" + norm(t) for u, t in comments]
@@ -179,9 +201,7 @@ def check_frozen(sig, display_log):
         sig_history.pop(0)
 
     if len(sig_history) == FREEZE_FRAMES and all(s == sig_history[0] for s in sig_history):
-        log("🟧 FREEZE → identical OCR frames", display_log)
         return True
-
     return False
 
 # ============================================================
@@ -191,7 +211,6 @@ def check_frozen(sig, display_log):
 def spam_pass(username, text, now, display_log):
     key = (norm(username), norm(text))
     times = spam_memory.get(key, [])
-
     times = [x for x in times if now - x < SPAM_WINDOW]
 
     if len(times) >= SPAM_MAX_COUNT:
@@ -201,19 +220,18 @@ def spam_pass(username, text, now, display_log):
 
     times.append(now)
     spam_memory[key] = times
-    log(f"🟪 SPAM PASS ({len(times)}/{SPAM_MAX_COUNT}) → @{username}: {text}", display_log)
     return True
 
 # ============================================================
 # MAIN LOOP
 # ============================================================
 
-def start_ocr(callback, debug=False,display_log=False):
-    global _sql, _cur, prev_edge_count, last_frame_norm
+def start_ocr(callback, debug=False, display_log=False):
+    global _sql, _cur, prev_edge_count, last_frame_norm, recent_signatures
 
     _sql, _cur = init_db(debug)
 
-    log("👉 Press F8 to select chat region", debug)
+    log("👉 Press F8 to select chat region", True)
     selector = ScreenSelector()
     region = None
 
@@ -223,7 +241,7 @@ def start_ocr(callback, debug=False,display_log=False):
         time.sleep(0.1)
 
     left, top, right, bottom = map(int, region)
-    log(f"📌 Region Selected: {left, top, right, bottom}", debug)
+    log(f"📌 Region Selected: {left, top, right, bottom}", True)
 
     with mss.mss() as sct:
         while True:
@@ -247,59 +265,63 @@ def start_ocr(callback, debug=False,display_log=False):
 
             if debug:
                 cv2.imshow("CHAT", frame)
-                cv2.imshow("EDGES", edges)
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
 
             if delta <= EDGE_DELTA_THRESHOLD:
-                # log(f"🟦 SKIP FRAME → delta={delta}", debug)
                 time.sleep(CAPTURE_SLEEP)
                 continue
 
-            log(f"🟦 OCR TRIGGER → delta={delta}", display_log)
-
             comments = ocr(frame) or []
-            log(f"🟨 OCR → {len(comments)} lines", display_log)
-
+            
             if check_frozen(build_signature(comments), display_log):
                 continue
 
             curr_norm = [normalize_line(u, t) for u, t in comments]
+            
             new_msgs = detect_new(last_frame_norm, curr_norm, comments, display_log)
             last_frame_norm = curr_norm
-
             now = time.time()
 
-            for username, text in new_msgs:
-                log(f"🟩 PROCESS → @{username}: {text}", display_log)
+            if new_msgs:
+                print(time.strftime("%H:%M:%S"), f"⚡ Detected {len(new_msgs)} new")
 
+            for username, text in new_msgs:
+                
+                # --- DEDUPLICATION LOGIC (FIXED) ---
+                sig = normalize_line(username, text)
+                
+                # Check if this exact message was seen recently
+                if sig in recent_signatures:
+                    last_seen_time = recent_signatures[sig]
+                    # If it has been less than timeout (45s), skip it.
+                    if now - last_seen_time < DEDUPE_TIMEOUT:
+                        continue
+                    # Otherwise, update timestamp and allow it (it's a repeat message)
+                
+                # 2. SPAM CHECK (Burst protection)
                 if not spam_pass(username, text, now, display_log):
                     continue
 
+                # 3. SQL / LONG TERM CHECK
                 if not sql_should_emit(username, text, now, display_log):
                     continue
 
+                # EMIT
+                recent_signatures[sig] = now
                 log(f"🟢 EMIT → @{username}: {text}", display_log)
                 callback(username, text)
+            
+            # Optional: Clean up memory dictionary every so often
+            if len(recent_signatures) > 1000:
+                recent_signatures = {k:v for k,v in recent_signatures.items() if now - v < DEDUPE_TIMEOUT}
 
             time.sleep(CAPTURE_SLEEP)
 
     if debug:
         cv2.destroyAllWindows()
 
-# ============================================================
-# TEST
-# ============================================================
-# ============================================================
-# SIMPLE TEST CALLBACK
-# ============================================================
-
-
-
-
-
 if __name__ == "__main__":
     def on_new_comment(user, text):
         print(f"NEW >> {user}: {text}")
-    start_ocr(on_new_comment, debug=True,display_log=False)
-
+    start_ocr(on_new_comment, debug=True, display_log=False)
