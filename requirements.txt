@@ -8,3 +8,4 @@ pillow
 sounddevice
 kokoro
 webrtcvad-wheels
+deep_translator==1.11.4
