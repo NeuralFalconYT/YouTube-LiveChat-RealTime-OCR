@@ -10,13 +10,9 @@ import re
 from PIL import Image, ImageDraw, ImageFont
 from kokoro import KPipeline
 import sounddevice as sd
-## For ai api reply
-# from dotenv import load_dotenv
-# load_dotenv()
+
 # OCR input
 from yt_ocr import start_ocr
-
-
 
 # =====================================
 # CONFIG
@@ -30,7 +26,7 @@ FONT_SIZE = 90
 USERNAME_SCALE = 0.6
 TEXT_COLOR = (255, 56, 178)
 USER_COLOR = (255, 2, 2)
-
+language_code = 'a'
 VOICE = "af_heart"
 SPEED = 0.8
 
@@ -55,17 +51,11 @@ current_frame = None        # latest frame to display
 def clean(user, text):
     """
     Clean and normalize username + text.
-    Prevents OCR garbage and weird unicode symbols.
     """
-
-    # If no real characters in username → replace
     if not re.search("[A-Za-z]", user):
         user = "Unknown"
 
-    # Remove unwanted characters from text
     text = re.sub(r"[^a-zA-Z0-9 .,!?\'\";:\-\(\)\[\]_]", " ", text)
-
-    # Collapse spaces
     text = re.sub(r"\s+", " ", text).strip()
 
     if len(text) <= 1:
@@ -79,25 +69,16 @@ def clean(user, text):
 # =====================================
 
 def render(user, text):
-    """
-    Creates the VTuber display frame showing the username + message
-    centered on the background image.
-    """
-
     img = Image.open(IMAGE_PATH).convert("RGBA")
     draw = ImageDraw.Draw(img)
     W, H = img.size
 
-    # Load fonts
     try:
         f_comment = ImageFont.truetype(FONT_PATH, FONT_SIZE)
         f_user = ImageFont.truetype(FONT_PATH, int(FONT_SIZE * USERNAME_SCALE))
     except:
         f_comment = f_user = ImageFont.load_default()
 
-    # ----------------------------------------
-    # Text wrapping helper
-    # ----------------------------------------
     def wrap(t, font, width_limit=W-200):
         lines, cur = [], ""
         for w in t.split():
@@ -113,21 +94,18 @@ def render(user, text):
 
     y = H // 2 - 300
 
-    # ----- USERNAME -----
     for l in wrap(user, f_user):
         w = draw.textbbox((0,0), l, font=f_user)[2]
         draw.text(((W-w)//2, y), l, font=f_user, fill=USER_COLOR)
         y += 45
 
-    y += 30  # space between username + comment
+    y += 30
 
-    # ----- COMMENT -----
     for l in wrap(text, f_comment):
         w = draw.textbbox((0,0), l, font=f_comment)[2]
         draw.text(((W-w)//2, y), l, font=f_comment, fill=TEXT_COLOR)
         y += 85
 
-    # Convert to OpenCV BGR image
     return cv2.resize(cv2.cvtColor(np.array(img), cv2.COLOR_RGBA2BGR), DISPLAY_SIZE)
 
 
@@ -135,13 +113,9 @@ def render(user, text):
 # TTS ENGINE
 # =====================================
 
-pipeline = KPipeline(lang_code='a')
+pipeline = KPipeline(lang_code=language_code)
 
 def speak(text):
-    """
-    Uses Kokoro-TTS to speak the comment.
-    Blocks until audio finished.
-    """
     RED = "\033[91m"
     GREEN = "\033[92m"
     RESET = "\033[0m"
@@ -157,7 +131,7 @@ def speak(text):
 
 
 # =====================================
-# DUPLICATE FILTER (simple 10-sec cooldown)
+# DUPLICATE FILTER
 # =====================================
 
 def is_duplicate(user, text):
@@ -178,7 +152,8 @@ def is_duplicate(user, text):
 def ocr_worker():
     """
     Runs OCR module in a thread.
-    Whenever a new chat message is detected, callback() sends it to msg_queue.
+    Passes 'display_log=False' to avoid cluttering console with debug info.
+    Passes 'debug=True' so we can see the CV2 window for OCR to check selection.
     """
 
     def callback(user, text):
@@ -187,41 +162,29 @@ def ocr_worker():
             return
 
         user, text = cleaned
-
-        # Prevent speaking same line twice within cooldown window
+        # print(time.strftime("%H:%M:%S"), f"📝 OCR: @{user}: {text}")
+        
         if not is_duplicate(user, text):
             msg_queue.put((user, text))
 
-    # Start OCR loop (this runs indefinitely)
-    start_ocr(callback, debug=True)
+    # IMPORTANT: We run start_ocr here.
+    # Because start_ocr uses keyboard.is_pressed('f8'), it should work even in thread.
+    # However, ensure the main CV2 window doesn't steal focus constantly.
+    start_ocr(callback, debug=True, display_log=False)
 
 
 # =====================================
-# TTS + FRAME WORKER (NEW: JUMP TO LIVE IF BACKLOG TOO LARGE)
+# TTS + FRAME WORKER
 # =====================================
 
 def tts_worker():
-    """
-    Reads messages from msg_queue and speaks them.
-    NEW FEATURE:
-        If queue backlog becomes too large (more than MAX_TTS_BACKLOG messages),
-        we CLEAR the queue and only speak the newest message.
-    This ensures TTS always stays LIVE and does NOT fall behind.
-    """
-
     global current_frame, running
 
     while running:
         try:
-            # -----------------------------------------------------
-            # NEW FEATURE: Jump ahead to live comment
-            # -----------------------------------------------------
             if msg_queue.qsize() > MAX_TTS_BACKLOG:
-                print(f"⚠ Backlog too large ({msg_queue.qsize()}). Jumping to live messages...")
-
+                print(f"⚠ Backlog too large ({msg_queue.qsize()}). Jumping to live...")
                 last_msg = None
-
-                # Empty queue but store last message
                 while not msg_queue.empty():
                     last_msg = msg_queue.get()
 
@@ -229,19 +192,14 @@ def tts_worker():
                     user, text = last_msg
                     current_frame = render(user, text)
                     speak(text)
+                continue
 
-                continue  # restart loop
-
-            # Normal mode: get next message
             user, text = msg_queue.get(timeout=1)
 
         except queue.Empty:
             continue
 
-        # Update VTuber screen
         current_frame = render(user, text)
-
-        # Speak the message
         speak(text)
 
 
@@ -252,23 +210,35 @@ def tts_worker():
 def main():
     global running, current_frame
 
-    # initial frame
-    current_frame = render("VTuber Ready", "Waiting for messages...")
+    current_frame = render("VTuber Ready", "Waiting for chat...")
 
-    # start threads
-    threading.Thread(target=tts_worker, daemon=True).start()
-    threading.Thread(target=ocr_worker, daemon=True).start()
+    # START OCR THREAD
+    # We must ensure this runs in background so main loop can handle its own UI
+    ocr_thread = threading.Thread(target=ocr_worker, daemon=True)
+    ocr_thread.start()
 
-    # UI window
+    # START TTS THREAD
+    tts_thread = threading.Thread(target=tts_worker, daemon=True)
+    tts_thread.start()
+
+    # Create VTuber Window
     cv2.namedWindow("VTuber", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("VTuber", *DISPLAY_SIZE)
+    # Move window to top-left so it doesn't overlap with OCR debug window
+    cv2.moveWindow("VTuber", 0, 0) 
 
-    while True:
-        cv2.imshow("VTuber", current_frame)
-        key = cv2.waitKey(30) & 0xFF
+    print("✅ Bot Started. Press F8 to select chat region. Press ESC to quit.")
+
+    while running:
+        if current_frame is not None:
+            cv2.imshow("VTuber", current_frame)
+        
+        # We use a small waitKey to keep the UI responsive
+        key = cv2.waitKey(100) & 0xFF
 
         if key == 27:  # ESC
             running = False
+            print("🛑 Stopping Bot...")
             break
 
     cv2.destroyAllWindows()
