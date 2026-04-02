@@ -183,11 +183,8 @@ def remove_emoji(text):
 # =====================
 # MAIN OCR PIPELINE
 # =====================
-
-def ocr(image):
+def ocr_pattern_1(raw_lines):
     try:
-        raw_lines = ocr_interface(image) or []
-
         clean = []
 
         for line in raw_lines:
@@ -222,7 +219,115 @@ def ocr(image):
         print("OCR Error:", e)
         return []
 
+import re
 
+def extract_time(text):
+    match = re.search(r'\b\d{1,2}[:.]\d{2}\s?(AM|PM)\b', text, re.IGNORECASE)
+    if match:
+        return match.group().replace(".", ":")
+    return None
+
+
+def is_new_chat(line):
+    return (
+        ":" in line or
+        re.search(r'@\w+', line)
+    )
+
+
+def extract_username_and_msg(text):
+    words = text.split()
+    username = None
+
+    for w in words:
+        if w.startswith("@"):
+            username = w
+            break
+
+    if username:
+        idx = words.index(username)
+        message = " ".join(words[idx + 1:]).strip()
+        return username, message
+
+    return None, None
+
+#time format ocr
+def ocr_pattern_2(raw_lines):
+    try:
+        wrong_ocr = ["Chat...", "$"]
+
+        chats = []
+        last_time = None
+
+        for text in raw_lines:
+
+            current_time = extract_time(text)
+
+            # update last known time
+            if current_time:
+                last_time = current_time
+
+            lines = re.split(r'\b(?:AM|PM)\b', text)
+
+            # print(f"Time: {current_time}")
+            # print(f"Text: {lines}")
+
+            if not lines:
+                continue
+
+            line0 = lines[0].strip()
+
+            # =====================
+            # CASE 1: NEW CHAT
+            # =====================
+            if is_new_chat(line0):
+                rest = " ".join(lines[1:]).strip()
+
+                username, comment = extract_username_and_msg(rest)
+
+                if username and comment:
+                    # print(f"User: {username}")
+                    # print(f"Comment: {comment}")
+
+                    chats.append((last_time, username, comment))
+
+            # =====================
+            # CASE 2: CONTINUATION
+            # =====================
+            else:
+                if (
+                    line0 not in wrong_ocr
+                    and len(line0) >= 2
+                    and not line0.startswith((" ", "@", "#", "http"))
+                ):
+                    rest = " ".join(lines).strip()
+                    # print(f"Rest: {rest}")
+
+                    if chats:
+                        last_t, last_user, last_msg = chats[-1]
+
+                        chats[-1] = (
+                            last_t,
+                            last_user,
+                            last_msg + " " + rest
+                        )
+    except Exception as e:
+        print("OCR Processing Error:", e)
+        return []
+
+    return chats
+
+def ocr(image):
+    raw_lines = ocr_interface(image) or []
+    chats = ocr_pattern_1(raw_lines)
+    if chats:
+        return chats
+    chats = ocr_pattern_2(raw_lines)
+    normalized = []
+    for _, user, msg in chats:
+        normalized.append((user, msg))
+    return normalized
+    
 if __name__ == "__main__":
     img = "test.jpg"
     result = ocr(img)
